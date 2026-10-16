@@ -45,7 +45,7 @@ public class RunAverageEmissionToolOffline {
         );
 
         ecg.setDetailedVsAverageLookupBehavior(
-                EmissionsConfigGroup.DetailedVsAverageLookupBehavior.directlyTryAverageTable
+                EmissionsConfigGroup.DetailedVsAverageLookupBehavior.tryDetailedThenTechnologyAverageThenAverageTable
         );
 
         ecg.setEmissionsComputationMethod(

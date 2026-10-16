@@ -2,17 +2,26 @@ package abm.calibration;
 
 import abm.data.DataSet;
 import abm.data.geo.Location;
+import abm.data.geo.RegioStaR2;
 import abm.data.plans.*;
 import abm.data.pop.Household;
 import abm.data.pop.Person;
+import abm.data.pop.RemoteWorkable;
 import abm.data.vehicle.Car;
 import abm.io.input.CalibrationZoneToRegionTypeReader;
 import abm.models.modeChoice.NestedLogitTourModeChoiceModel;
 import abm.properties.AbitResources;
+import de.tum.bgu.msm.data.person.Occupation;
 import org.apache.log4j.Logger;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
 
 import java.io.FileNotFoundException;
 import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.DayOfWeek;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -28,11 +37,26 @@ public class TourModeChoiceCalibration implements ModelComponent {
 
     double stepSize = 1.00;
     String inputFolder = AbitResources.instance.getString("tour.mode.coef.output");
+    String tourModeObjectivesPath = AbitResources.instance.getString("tour.mode.calibration.objectives");
+    String workTourModeObjectivesPath = AbitResources.instance.getString("tour.mode.calibration.objectives.work");
+
     DataSet dataSet;
     Map<String, Map<Purpose, Map<DayOfWeek, Map<Mode, Double>>>> objectiveTourModeShare = new HashMap<>();
     Map<String,Map<Purpose, Map<DayOfWeek, Map<Mode, Integer>>>> simulatedTourModeCount = new HashMap<>();
     Map<String,Map<Purpose, Map<DayOfWeek, Map<Mode, Double>>>> simulatedTourModeShare = new HashMap<>();
     Map<String,Map<Purpose, Map<DayOfWeek, Map<Mode, Double>>>> calibrationFactors = new HashMap<>();
+
+
+    Map<Occupation, Map<RemoteWorkable, Map<RegioStaR2, Map<Mode, Double>>>> workObjectiveTourModeShare = new HashMap<>();
+    Map<Occupation, Map<RemoteWorkable, Map<RegioStaR2, Map<Mode, Integer>>>> simulatedWorkTourModeCount = new HashMap<>();
+    Map<Occupation, Map<RemoteWorkable, Map<RegioStaR2, Map<Mode, Double>>>> simulatedWorkTourModeShare = new HashMap<>();
+    Map<Occupation, Map<RemoteWorkable, Map<RegioStaR2, Map<Mode, Double>>>> workCalibrationFactors = new HashMap<>();
+
+    Map<Purpose, Map<Occupation, Map<String, Map<RegioStaR2, Map<Mode, Double>>>>> discretionaryObjectiveTourModeShare = new HashMap<>();
+    Map<Purpose, Map<Occupation, Map<String, Map<RegioStaR2, Map<Mode, Integer>>>>> simulatedDiscretionaryTourModeCount = new HashMap<>();
+    Map<Purpose, Map<Occupation, Map<String, Map<RegioStaR2, Map<Mode, Double>>>>> simulatedDiscretionaryTourModeShare = new HashMap<>();
+    Map<Purpose, Map<Occupation, Map<String, Map<RegioStaR2, Map<Mode, Double>>>>> discretionaryCalibrationFactors = new HashMap<>();
+
     private NestedLogitTourModeChoiceModel tourModeChoiceModelCalibration;
     //private CalibrationZoneToRegionTypeReader zoneToRegionMap;
 
@@ -79,15 +103,44 @@ public class TourModeChoiceCalibration implements ModelComponent {
                 }
             }
         }
+
+        for (Occupation occupation : Occupation.values()) {
+            workObjectiveTourModeShare.putIfAbsent(occupation, new HashMap<>());
+            simulatedWorkTourModeCount.putIfAbsent(occupation, new HashMap<>());
+            simulatedWorkTourModeShare.putIfAbsent(occupation, new HashMap<>());
+            workCalibrationFactors.putIfAbsent(occupation, new HashMap<>());
+
+            for (RemoteWorkable remoteWorkable : RemoteWorkable.values()) {
+                workObjectiveTourModeShare.get(occupation).putIfAbsent(remoteWorkable, new HashMap<>());
+                simulatedWorkTourModeCount.get(occupation).putIfAbsent(remoteWorkable, new HashMap<>());
+                simulatedWorkTourModeShare.get(occupation).putIfAbsent(remoteWorkable, new HashMap<>());
+                workCalibrationFactors.get(occupation).putIfAbsent(remoteWorkable, new HashMap<>());
+
+                for (RegioStaR2 regioStaR2 : RegioStaR2.values()) {
+                    workObjectiveTourModeShare.get(occupation).get(remoteWorkable).putIfAbsent(regioStaR2, new HashMap<>());
+                    simulatedWorkTourModeCount.get(occupation).get(remoteWorkable).putIfAbsent(regioStaR2, new HashMap<>());
+                    simulatedWorkTourModeShare.get(occupation).get(remoteWorkable).putIfAbsent(regioStaR2, new HashMap<>());
+                    workCalibrationFactors.get(occupation).get(remoteWorkable).putIfAbsent(regioStaR2, new HashMap<>());
+
+                    for (Mode mode : Mode.getModes()) {
+                        workObjectiveTourModeShare.get(occupation).get(remoteWorkable).get(regioStaR2).putIfAbsent(mode, 0.0);
+                        simulatedWorkTourModeCount.get(occupation).get(remoteWorkable).get(regioStaR2).putIfAbsent(mode, 0);
+                        simulatedWorkTourModeShare.get(occupation).get(remoteWorkable).get(regioStaR2).putIfAbsent(mode, 0.0);
+                        workCalibrationFactors.get(occupation).get(remoteWorkable).get(regioStaR2).putIfAbsent(mode, 0.0);
+                    }
+                }
+            }
+        }
     }
 
     @Override
     public void load() {
-        //Todo: read objective values
+
         readObjectiveValues();
 
-        //Todo: consider having the result summarization in the statistics writer
         summarizeSimulatedResult();
+        summarizeWorkSimulatedResult();
+        summarizeDiscretionarySimulatedResult();
     }
 
     @Override
@@ -101,29 +154,49 @@ public class TourModeChoiceCalibration implements ModelComponent {
             logger.info("Iteration......" + iteration);
             double maxDifference = 0.0;
 
-            //Todo summarize share difference and share
-            for (String region : regions) {
-                for (Purpose purpose : Purpose.getAllPurposes()) {
-                    for (DayOfWeek dayOfWeek : DayOfWeek.values()) {
+            //........................................
+            for (Occupation occupation : workObjectiveTourModeShare.keySet()) {
+
+                for (RemoteWorkable remoteWorkable :
+                        workObjectiveTourModeShare.get(occupation).keySet()) {
+
+                    for (RegioStaR2 regioStaR2 :
+                            workObjectiveTourModeShare
+                                    .get(occupation)
+                                    .get(remoteWorkable)
+                                    .keySet()) {
+
                         for (Mode mode : Mode.getModes()) {
-                            double observedShare = objectiveTourModeShare.get(region).get(purpose).get(dayOfWeek).get(mode);
-                            double simulatedShare = simulatedTourModeShare.get(region).get(purpose).get(dayOfWeek).get(mode);
-                            double difference = observedShare - simulatedShare;
-                            double factor = stepSize * (observedShare - simulatedShare);
+
+                            double observedShare =
+                                    workObjectiveTourModeShare
+                                            .get(occupation)
+                                            .get(remoteWorkable)
+                                            .get(regioStaR2)
+                                            .get(mode);
+
+                            double simulatedShare =
+                                    simulatedWorkTourModeShare
+                                            .get(occupation)
+                                            .get(remoteWorkable)
+                                            .get(regioStaR2)
+                                            .get(mode);
+
+                            double difference =
+                                    observedShare - simulatedShare;
+
+                            double factor =
+                                    stepSize * difference;
+
                             if (mode.equals(Mode.CAR_DRIVER)) {
                                 factor = 0.00;
                             }
-                            if (dayOfWeek.equals(DayOfWeek.SUNDAY) && purpose.equals(Purpose.SHOPPING)) {
-                                factor = 0.00;
-                            }
-                            calibrationFactors.get(region).get(purpose).get(dayOfWeek).replace(mode, factor);
 
-                            if (dayOfWeek.equals(DayOfWeek.MONDAY) || dayOfWeek.equals(DayOfWeek.SATURDAY)){
-                                logger.info("Tour mode choice model for " + purpose.toString() + "\t" + dayOfWeek.toString() + "\t" + " and " + mode.toString() + "\t" + region  + "\t" +
-                                        "difference: " + difference);
-                            }
-
-
+                            workCalibrationFactors
+                                    .get(occupation)
+                                    .get(remoteWorkable)
+                                    .get(regioStaR2)
+                                    .put(mode, factor);
 
                             if (Math.abs(difference) > maxDifference) {
                                 maxDifference = Math.abs(difference);
@@ -133,7 +206,89 @@ public class TourModeChoiceCalibration implements ModelComponent {
                 }
             }
 
-            tourModeChoiceModelCalibration.updateCalibrationFactor(calibrationFactors);
+            tourModeChoiceModelCalibration
+                    .updateWorkCalibrationFactor(workCalibrationFactors);
+            //.................................
+
+            for (Purpose purpose :
+                    discretionaryObjectiveTourModeShare.keySet()) {
+
+                for (Occupation occupation :
+                        discretionaryObjectiveTourModeShare
+                                .get(purpose)
+                                .keySet()) {
+
+                    for (String dayType :
+                            discretionaryObjectiveTourModeShare
+                                    .get(purpose)
+                                    .get(occupation)
+                                    .keySet()) {
+
+                        for (RegioStaR2 regioStaR2 :
+                                discretionaryObjectiveTourModeShare
+                                        .get(purpose)
+                                        .get(occupation)
+                                        .get(dayType)
+                                        .keySet()) {
+
+                            for (Mode mode : Mode.getModes()) {
+
+                                double observedShare =
+                                        discretionaryObjectiveTourModeShare
+                                                .get(purpose)
+                                                .get(occupation)
+                                                .get(dayType)
+                                                .get(regioStaR2)
+                                                .get(mode);
+
+                                double simulatedShare =
+                                        simulatedDiscretionaryTourModeShare
+                                                .get(purpose)
+                                                .get(occupation)
+                                                .get(dayType)
+                                                .get(regioStaR2)
+                                                .get(mode);
+
+                                double difference =
+                                        observedShare - simulatedShare;
+
+                                double factor =
+                                        stepSize * (observedShare - simulatedShare);
+
+                                if (mode.equals(Mode.CAR_DRIVER)) {
+                                    factor = 0.00;
+                                }
+
+                                /*
+                                 * Old special rule:
+                                 *
+                                 * SUNDAY + SHOPPING
+                                 *
+                                 * This old rule has no direct equivalent in the
+                                 * new dayType segmentation, because dayType is
+                                 * NO_WORKING_DAY / WFH_DAY / WFW_DAY.
+                                 *
+                                 * Therefore DO NOT blindly carry it over here.
+                                 */
+
+                                discretionaryCalibrationFactors
+                                        .get(purpose)
+                                        .get(occupation)
+                                        .get(dayType)
+                                        .get(regioStaR2)
+                                        .put(mode, factor);
+
+                                if (Math.abs(difference) > maxDifference) {
+                                    maxDifference =
+                                            Math.abs(difference);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            tourModeChoiceModelCalibration.updateDiscretionaryCalibrationFactor(discretionaryCalibrationFactors);
 
             if (maxDifference <= TERMINATION_THRESHOLD) {
                 break;
@@ -206,162 +361,432 @@ public class TourModeChoiceCalibration implements ModelComponent {
             }
 
             summarizeSimulatedResult();
+            summarizeWorkSimulatedResult();
+            summarizeDiscretionarySimulatedResult();
 
         }
 
         logger.info("Finished the calibration of habitual mode choice model.");
 
-        //Todo: obtain the updated coefficients + calibration factors
-        Map<Purpose, Map<Mode, Map<String, Double>>> finalCoefficientsTable = tourModeChoiceModelCalibration.obtainCoefficientsTable();
-
-        //Todo: print the coefficients table to input folder
         try {
-            printFinalCoefficientsTable(finalCoefficientsTable);
+            printCalibrationFactors();
         } catch (FileNotFoundException e) {
-            System.err.println("Output path of the coefficient table is not correct.");
+            System.err.println("Output path of the calibration factor files is not correct.");
         }
 
     }
 
-    //WORK; EDUCATION; ACCOMPANY; OTHER; SHOP; RECR
     private void readObjectiveValues() {
-        //map for muc region
-        Map<Mode, Double> weekdayValuesMucWork = Map.of(
-                Mode.CAR_DRIVER, 0.38, Mode.CAR_PASSENGER, 0.01, Mode.BUS, 0.02,
-                Mode.TRAIN, 0.18, Mode.TRAM_METRO, 0.26, Mode.BIKE, 0.12, Mode.WALK, 0.02);
-        Map<Mode, Double> weekendValuesMucWork = Map.of(
-                Mode.CAR_DRIVER, 0.47, Mode.CAR_PASSENGER, 0.01, Mode.BUS, 0.03,
-                Mode.TRAIN, 0.11, Mode.TRAM_METRO, 0.25, Mode.BIKE, 0.11, Mode.WALK, 0.02);
-        Map<Mode, Double> weekdayValuesMucEducation = Map.of(
-                Mode.CAR_DRIVER, 0.03, Mode.CAR_PASSENGER, 0.17, Mode.BUS, 0.10,
-                Mode.TRAIN, 0.13, Mode.TRAM_METRO, 0.24, Mode.BIKE, 0.21, Mode.WALK, 0.12);
-        Map<Mode, Double> weekendValuesMucEducation = Map.of(
-                Mode.CAR_DRIVER, 0.09, Mode.CAR_PASSENGER, 0.12, Mode.BUS, 0.04,
-                Mode.TRAIN, 0.22, Mode.TRAM_METRO, 0.35, Mode.BIKE, 0.13, Mode.WALK, 0.05);
-        Map<Mode, Double> weekdayValuesMucAccompany = Map.of(
-                Mode.CAR_DRIVER, 0.46, Mode.CAR_PASSENGER, 0.16, Mode.BUS, 0.02,
-                Mode.TRAIN, 0.04, Mode.TRAM_METRO, 0.10, Mode.BIKE, 0.10, Mode.WALK, 0.12);
-        Map<Mode, Double> weekendValuesMucAccompany = Map.of(
-                Mode.CAR_DRIVER, 0.30, Mode.CAR_PASSENGER, 0.24, Mode.BUS, 0.01,
-                Mode.TRAIN, 0.04, Mode.TRAM_METRO, 0.18, Mode.BIKE, 0.06, Mode.WALK, 0.16);
-        Map<Mode, Double> weekdayValuesMucShop = Map.of(
-                Mode.CAR_DRIVER, 0.31, Mode.CAR_PASSENGER, 0.09, Mode.BUS, 0.04,
-                Mode.TRAIN, 0.06, Mode.TRAM_METRO, 0.13, Mode.BIKE, 0.12, Mode.WALK, 0.25);
-        Map<Mode, Double> weekendValuesMucShop = Map.of(
-                Mode.CAR_DRIVER, 0.31, Mode.CAR_PASSENGER, 0.13, Mode.BUS, 0.03,
-                Mode.TRAIN, 0.04, Mode.TRAM_METRO, 0.11, Mode.BIKE, 0.14, Mode.WALK, 0.23);
-        Map<Mode, Double> weekdayValuesMucOther = Map.of(
-                Mode.CAR_DRIVER, 0.28, Mode.CAR_PASSENGER, 0.12, Mode.BUS, 0.05,
-                Mode.TRAIN, 0.09, Mode.TRAM_METRO, 0.21, Mode.BIKE, 0.09, Mode.WALK, 0.16);
-        Map<Mode, Double> weekendValuesMucOther = Map.of(
-                Mode.CAR_DRIVER, 0.30, Mode.CAR_PASSENGER, 0.23, Mode.BUS, 0.03,
-                Mode.TRAIN, 0.07, Mode.TRAM_METRO, 0.13, Mode.BIKE, 0.08, Mode.WALK, 0.17);
-        Map<Mode, Double> weekdayValuesMucRecreation = Map.of(
-                Mode.CAR_DRIVER, 0.20, Mode.CAR_PASSENGER, 0.13, Mode.BUS, 0.04,
-                Mode.TRAIN, 0.08, Mode.TRAM_METRO, 0.17, Mode.BIKE, 0.17, Mode.WALK, 0.22);
-        Map<Mode, Double> weekendValuesMucRecreation = Map.of(
-                Mode.CAR_DRIVER, 0.22, Mode.CAR_PASSENGER, 0.19, Mode.BUS, 0.03,
-                Mode.TRAIN, 0.08, Mode.TRAM_METRO, 0.16, Mode.BIKE, 0.13, Mode.WALK, 0.20);
-        // maps for nonmuc region
-        Map<Mode, Double> weekdayValuesNonmucWork = Map.of(
-                Mode.CAR_DRIVER, 0.68, Mode.CAR_PASSENGER, 0.03, Mode.BUS, 0.02,
-                Mode.TRAIN, 0.13, Mode.TRAM_METRO, 0.03, Mode.BIKE, 0.08, Mode.WALK, 0.03);
-        Map<Mode, Double> weekendValuesNonmucWork = Map.of(
-                Mode.CAR_DRIVER, 0.68, Mode.CAR_PASSENGER, 0.13, Mode.BUS, 0.02,
-                Mode.TRAIN, 0.06, Mode.TRAM_METRO, 0.02, Mode.BIKE, 0.05, Mode.WALK, 0.05);
-        Map<Mode, Double> weekdayValuesNonmucEducation = Map.of(
-                Mode.CAR_DRIVER, 0.07, Mode.CAR_PASSENGER, 0.23, Mode.BUS, 0.25,
-                Mode.TRAIN, 0.12, Mode.TRAM_METRO, 0.03, Mode.BIKE, 0.16, Mode.WALK, 0.12);
-        Map<Mode, Double> weekendValuesNonmucEducation = Map.of(
-                Mode.CAR_DRIVER, 0.19, Mode.CAR_PASSENGER, 0.07, Mode.BUS, 0.15,
-                Mode.TRAIN, 0.28, Mode.TRAM_METRO, 0.05, Mode.BIKE, 0.15, Mode.WALK, 0.11);
-        Map<Mode, Double> weekdayValuesNonmucAccompany = Map.of(
-                Mode.CAR_DRIVER, 0.68, Mode.CAR_PASSENGER, 0.18, Mode.BUS, 0.02,
-                Mode.TRAIN, 0.01, Mode.TRAM_METRO, 0.01, Mode.BIKE, 0.05, Mode.WALK, 0.05);
-        Map<Mode, Double> weekendValuesNonmucAccompany = Map.of(
-                Mode.CAR_DRIVER, 0.57, Mode.CAR_PASSENGER, 0.31, Mode.BUS, 0.01,
-                Mode.TRAIN, 0.01, Mode.TRAM_METRO, 0.01, Mode.BIKE, 0.05, Mode.WALK, 0.04);
-        Map<Mode, Double> weekdayValuesNonmucShop = Map.of(
-                Mode.CAR_DRIVER, 0.56, Mode.CAR_PASSENGER, 0.14, Mode.BUS, 0.01,
-                Mode.TRAIN, 0.02, Mode.TRAM_METRO, 0.01, Mode.BIKE, 0.13, Mode.WALK, 0.13);
-        Map<Mode, Double> weekendValuesNonmucShop = Map.of(
-                Mode.CAR_DRIVER, 0.54, Mode.CAR_PASSENGER, 0.19, Mode.BUS, 0.01,
-                Mode.TRAIN, 0.02, Mode.TRAM_METRO, 0.01, Mode.BIKE, 0.14, Mode.WALK, 0.10);
-        Map<Mode, Double> weekdayValuesNonmucOther = Map.of(
-                Mode.CAR_DRIVER, 0.52, Mode.CAR_PASSENGER, 0.17, Mode.BUS, 0.03,
-                Mode.TRAIN, 0.05, Mode.TRAM_METRO, 0.02, Mode.BIKE, 0.11, Mode.WALK, 0.11);
-        Map<Mode, Double> weekendValuesNonmucOther = Map.of(
-                Mode.CAR_DRIVER, 0.46, Mode.CAR_PASSENGER, 0.25, Mode.BUS, 0.01,
-                Mode.TRAIN, 0.03, Mode.TRAM_METRO, 0.01, Mode.BIKE, 0.09, Mode.WALK, 0.15);
-        Map<Mode, Double> weekdayValuesNonmucRecreation = Map.of(
-                Mode.CAR_DRIVER, 0.33, Mode.CAR_PASSENGER, 0.22, Mode.BUS, 0.01,
-                Mode.TRAIN, 0.03, Mode.TRAM_METRO, 0.01, Mode.BIKE, 0.17, Mode.WALK, 0.22);
-        Map<Mode, Double> weekendValuesNonmucRecreation = Map.of(
-                Mode.CAR_DRIVER, 0.35, Mode.CAR_PASSENGER, 0.27, Mode.BUS, 0.01,
-                Mode.TRAIN, 0.03, Mode.TRAM_METRO, 0.01, Mode.BIKE, 0.12, Mode.WALK, 0.22);
+        readWorkObjectives(Path.of(workTourModeObjectivesPath));
 
+        readDiscretionaryObjectives(Path.of(tourModeObjectivesPath));
+    }
 
-        // Initialize the main map for all combinations
-        objectiveTourModeShare = new HashMap<>();
+    private void readWorkObjectives(Path objectiveFile) {
 
-        for (String region : List.of("muc", "nonMuc")) {
-            Map<Purpose, Map<DayOfWeek, Map<Mode, Double>>> purposeMap = new HashMap<>();
-            for (Purpose purpose : Purpose.values()) {
-                Map<DayOfWeek, Map<Mode, Double>> dayMap = new EnumMap<>(DayOfWeek.class);
-                for (DayOfWeek dayOfWeek : DayOfWeek.values()) {
-                    Map<Mode, Double> values;
-                    if (region.equals("muc")) {
-                        switch (purpose) {
-                            case WORK:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesMucWork : weekdayValuesMucWork;
-                                break;
-                            case EDUCATION:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesMucEducation : weekdayValuesMucEducation;
-                                break;
-                            case ACCOMPANY:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesMucAccompany : weekdayValuesMucAccompany;
-                                break;
-                            case SHOPPING:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesMucShop : weekdayValuesMucShop;
-                                break;
-                            case OTHER:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesMucOther : weekdayValuesMucOther;
-                                break;
-                            case RECREATION:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesMucRecreation : weekdayValuesMucRecreation;
-                                break;
-                            default:
-                                values = new HashMap<>(); // Default empty map
-                        }
-                    } else {
-                        switch (purpose) {
-                            case WORK:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesNonmucWork : weekdayValuesNonmucWork;
-                                break;
-                            case EDUCATION:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesNonmucEducation : weekdayValuesNonmucEducation;
-                                break;
-                            case ACCOMPANY:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesNonmucAccompany : weekdayValuesNonmucAccompany;
-                                break;
-                            case SHOPPING:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesNonmucShop : weekdayValuesNonmucShop;
-                                break;
-                            case OTHER:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesNonmucOther : weekdayValuesNonmucOther;
-                                break;
-                            case RECREATION:
-                                values = dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY ? weekendValuesNonmucRecreation : weekdayValuesNonmucRecreation;
-                                break;
-                            default:
-                                values = new HashMap<>(); // Default empty map
-                        }
-                    }
-                    dayMap.put(dayOfWeek, new HashMap<>(values));
-                }
-                purposeMap.put(purpose, dayMap);
+        logger.info("Reading WORK tour mode choice objectives from: " + objectiveFile);
+
+        try (BufferedReader br = Files.newBufferedReader(objectiveFile)) {
+
+            String line;
+
+            String header = br.readLine();
+
+            if (header == null) {
+                throw new IllegalArgumentException(
+                        "WORK objective CSV file is empty: " + objectiveFile);
             }
-            objectiveTourModeShare.put(region, purposeMap);
+
+            while ((line = br.readLine()) != null) {
+
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+
+                String[] values = line.split(",");
+
+                if (values.length != 6) {
+                    throw new IllegalArgumentException(
+                            "Invalid WORK objective CSV row: " + line);
+                }
+
+                Occupation occupation =
+                        Occupation.valueOf(values[1].trim().toUpperCase());
+
+                RemoteWorkable remoteWorkable =
+                        RemoteWorkable.valueOf(values[2].trim().toUpperCase());
+
+                RegioStaR2 regioStaR2 =
+                        RegioStaR2.valueOf(values[3].trim().toUpperCase());
+
+                Mode mode =
+                        Mode.valueOf(values[4].trim().toUpperCase());
+
+                double objectiveShare =
+                        Double.parseDouble(values[5].trim());
+
+                workObjectiveTourModeShare
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+                simulatedWorkTourModeCount
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+                simulatedWorkTourModeShare
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+                workCalibrationFactors
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+
+                workObjectiveTourModeShare
+                        .get(occupation)
+                        .putIfAbsent(
+                                remoteWorkable,
+                                new HashMap<>());
+
+                simulatedWorkTourModeCount
+                        .get(occupation)
+                        .putIfAbsent(
+                                remoteWorkable,
+                                new HashMap<>());
+
+                simulatedWorkTourModeShare
+                        .get(occupation)
+                        .putIfAbsent(
+                                remoteWorkable,
+                                new HashMap<>());
+
+                workCalibrationFactors
+                        .get(occupation)
+                        .putIfAbsent(
+                                remoteWorkable,
+                                new HashMap<>());
+
+
+                workObjectiveTourModeShare
+                        .get(occupation)
+                        .get(remoteWorkable)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+                simulatedWorkTourModeCount
+                        .get(occupation)
+                        .get(remoteWorkable)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+                simulatedWorkTourModeShare
+                        .get(occupation)
+                        .get(remoteWorkable)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+                workCalibrationFactors
+                        .get(occupation)
+                        .get(remoteWorkable)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+
+                for (Mode availableMode : Mode.getModes()) {
+
+                    workObjectiveTourModeShare
+                            .get(occupation)
+                            .get(remoteWorkable)
+                            .get(regioStaR2)
+                            .putIfAbsent(
+                                    availableMode,
+                                    0.0);
+
+                    simulatedWorkTourModeCount
+                            .get(occupation)
+                            .get(remoteWorkable)
+                            .get(regioStaR2)
+                            .putIfAbsent(
+                                    availableMode,
+                                    0);
+
+                    simulatedWorkTourModeShare
+                            .get(occupation)
+                            .get(remoteWorkable)
+                            .get(regioStaR2)
+                            .putIfAbsent(
+                                    availableMode,
+                                    0.0);
+
+                    workCalibrationFactors
+                            .get(occupation)
+                            .get(remoteWorkable)
+                            .get(regioStaR2)
+                            .putIfAbsent(
+                                    availableMode,
+                                    0.0);
+                }
+
+                workObjectiveTourModeShare
+                        .get(occupation)
+                        .get(remoteWorkable)
+                        .get(regioStaR2)
+                        .put(mode, objectiveShare);
+            }
+
+            logger.info(
+                    "Successfully loaded WORK tour mode choice objectives from: "
+                            + objectiveFile);
+
+        } catch (IOException e) {
+
+            throw new RuntimeException(
+                    "Could not read WORK tour mode choice objective file: "
+                            + objectiveFile,
+                    e);
+        }
+    }
+
+    //WORK; EDUCATION; ACCOMPANY; OTHER; SHOP; RECR
+    private void readDiscretionaryObjectives(Path objectiveFile) {
+
+        logger.info(
+                "Reading DISCRETIONARY tour mode choice objectives from: "
+                        + objectiveFile);
+
+        try (BufferedReader br = Files.newBufferedReader(objectiveFile)) {
+
+            String line;
+
+            String header = br.readLine();
+
+            if (header == null) {
+                throw new IllegalArgumentException(
+                        "DISCRETIONARY objective CSV file is empty: "
+                                + objectiveFile);
+            }
+
+            while ((line = br.readLine()) != null) {
+
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+
+                String[] values = line.split(",", -1);
+
+                if (values.length != 6) {
+                    throw new IllegalArgumentException(
+                            "Invalid DISCRETIONARY objective CSV row: "
+                                    + line);
+                }
+
+                Purpose purpose =
+                        Purpose.valueOf(
+                                values[0].trim().toUpperCase());
+
+                Occupation occupation =
+                        Occupation.valueOf(
+                                values[1].trim().toUpperCase());
+
+                String dayType =
+                        values[2].trim().toUpperCase();
+
+                RegioStaR2 regioStaR2 =
+                        RegioStaR2.valueOf(
+                                values[3].trim().toUpperCase());
+
+                Mode mode =
+                        Mode.valueOf(
+                                values[4].trim().toUpperCase());
+
+                double objectiveShare =
+                        Double.parseDouble(
+                                values[5].trim());
+
+
+                // -------------------------------------------------
+                // PURPOSE
+                // -------------------------------------------------
+
+                discretionaryObjectiveTourModeShare
+                        .putIfAbsent(
+                                purpose,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeCount
+                        .putIfAbsent(
+                                purpose,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeShare
+                        .putIfAbsent(
+                                purpose,
+                                new HashMap<>());
+
+                discretionaryCalibrationFactors
+                        .putIfAbsent(
+                                purpose,
+                                new HashMap<>());
+
+
+                // -------------------------------------------------
+                // OCCUPATION
+                // -------------------------------------------------
+
+                discretionaryObjectiveTourModeShare
+                        .get(purpose)
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeCount
+                        .get(purpose)
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeShare
+                        .get(purpose)
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+                discretionaryCalibrationFactors
+                        .get(purpose)
+                        .putIfAbsent(
+                                occupation,
+                                new HashMap<>());
+
+
+                // -------------------------------------------------
+                // DAY TYPE
+                // -------------------------------------------------
+
+                discretionaryObjectiveTourModeShare
+                        .get(purpose)
+                        .get(occupation)
+                        .putIfAbsent(
+                                dayType,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeCount
+                        .get(purpose)
+                        .get(occupation)
+                        .putIfAbsent(
+                                dayType,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeShare
+                        .get(purpose)
+                        .get(occupation)
+                        .putIfAbsent(
+                                dayType,
+                                new HashMap<>());
+
+                discretionaryCalibrationFactors
+                        .get(purpose)
+                        .get(occupation)
+                        .putIfAbsent(
+                                dayType,
+                                new HashMap<>());
+
+
+                // -------------------------------------------------
+                // REGIOSTAR2
+                // -------------------------------------------------
+
+                discretionaryObjectiveTourModeShare
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeCount
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+                simulatedDiscretionaryTourModeShare
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+                discretionaryCalibrationFactors
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .putIfAbsent(
+                                regioStaR2,
+                                new HashMap<>());
+
+
+                // -------------------------------------------------
+                // MODE
+                // -------------------------------------------------
+
+                discretionaryObjectiveTourModeShare
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .get(regioStaR2)
+                        .put(
+                                mode,
+                                objectiveShare);
+
+                simulatedDiscretionaryTourModeCount
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .get(regioStaR2)
+                        .putIfAbsent(
+                                mode,
+                                0);
+
+                simulatedDiscretionaryTourModeShare
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .get(regioStaR2)
+                        .putIfAbsent(
+                                mode,
+                                0.0);
+
+                discretionaryCalibrationFactors
+                        .get(purpose)
+                        .get(occupation)
+                        .get(dayType)
+                        .get(regioStaR2)
+                        .putIfAbsent(
+                                mode,
+                                0.0);
+            }
+
+            logger.info(
+                    "Successfully loaded DISCRETIONARY tour mode choice objectives from: "
+                            + objectiveFile);
+
+        } catch (IOException e) {
+
+            throw new RuntimeException(
+                    "Could not read DISCRETIONARY tour mode choice objective file: "
+                            + objectiveFile,
+                    e);
         }
     }
 
@@ -436,6 +861,367 @@ public class TourModeChoiceCalibration implements ModelComponent {
         }
     }
 
+    private void summarizeWorkSimulatedResult() {
+
+        // Reset WORK counts and shares only for segments
+        // that actually exist in the objective file.
+
+        for (Occupation occupation : workObjectiveTourModeShare.keySet()) {
+
+            for (RemoteWorkable remoteWorkable :
+                    workObjectiveTourModeShare.get(occupation).keySet()) {
+
+                for (RegioStaR2 regioStaR2 :
+                        workObjectiveTourModeShare
+                                .get(occupation)
+                                .get(remoteWorkable)
+                                .keySet()) {
+
+                    for (Mode mode : Mode.getModes()) {
+
+                        simulatedWorkTourModeCount
+                                .get(occupation)
+                                .get(remoteWorkable)
+                                .get(regioStaR2)
+                                .put(mode, 0);
+
+                        simulatedWorkTourModeShare
+                                .get(occupation)
+                                .get(remoteWorkable)
+                                .get(regioStaR2)
+                                .put(mode, 0.0);
+                    }
+                }
+            }
+        }
+
+
+        // Count simulated WORK tours
+        for (Household household : dataSet.getHouseholds().values()) {
+
+            if (!household.getSimulated()) {
+                continue;
+            }
+
+            for (Person person : household.getPersons()) {
+
+                Occupation occupation = person.getOccupation();
+                RemoteWorkable remoteWorkable = getRemoteWorkable(person);
+
+                RegioStaR2 regioStaR2 =
+                        dataSet.getZones()
+                                .get(person.getHousehold().getLocation().getZoneId())
+                                .getRegioStaR2Type();
+
+                // Skip combinations that do not exist in the objective file.
+                if (!workObjectiveTourModeShare.containsKey(occupation)) {
+                    continue;
+                }
+
+                if (!workObjectiveTourModeShare
+                        .get(occupation)
+                        .containsKey(remoteWorkable)) {
+                    continue;
+                }
+
+                if (!workObjectiveTourModeShare
+                        .get(occupation)
+                        .get(remoteWorkable)
+                        .containsKey(regioStaR2)) {
+                    continue;
+                }
+
+                for (Tour tour : person.getPlan().getTours().values()) {
+
+                    if (!tour.getMainActivity()
+                            .getPurpose()
+                            .equals(Purpose.WORK)) {
+                        continue;
+                    }
+
+                    Mode mode = tour.getTourMode();
+
+                    int count =
+                            simulatedWorkTourModeCount
+                                    .get(occupation)
+                                    .get(remoteWorkable)
+                                    .get(regioStaR2)
+                                    .get(mode);
+
+                    simulatedWorkTourModeCount
+                            .get(occupation)
+                            .get(remoteWorkable)
+                            .get(regioStaR2)
+                            .put(mode, count + 1);
+                }
+            }
+        }
+
+
+        // Calculate WORK mode shares
+        for (Occupation occupation : workObjectiveTourModeShare.keySet()) {
+
+            for (RemoteWorkable remoteWorkable :
+                    workObjectiveTourModeShare.get(occupation).keySet()) {
+
+                for (RegioStaR2 regioStaR2 :
+                        workObjectiveTourModeShare
+                                .get(occupation)
+                                .get(remoteWorkable)
+                                .keySet()) {
+
+                    int cumulativeSum = 0;
+
+                    for (Mode mode : Mode.getModes()) {
+
+                        cumulativeSum +=
+                                simulatedWorkTourModeCount
+                                        .get(occupation)
+                                        .get(remoteWorkable)
+                                        .get(regioStaR2)
+                                        .get(mode);
+                    }
+
+                    for (Mode mode : Mode.getModes()) {
+
+                        double share = 0.0;
+
+                        if (cumulativeSum > 0) {
+                            share =
+                                    (double)
+                                            simulatedWorkTourModeCount
+                                                    .get(occupation)
+                                                    .get(remoteWorkable)
+                                                    .get(regioStaR2)
+                                                    .get(mode)
+                                            / cumulativeSum;
+                        }
+
+                        simulatedWorkTourModeShare
+                                .get(occupation)
+                                .get(remoteWorkable)
+                                .get(regioStaR2)
+                                .put(mode, share);
+                    }
+                }
+            }
+        }
+    }
+
+    private void summarizeDiscretionarySimulatedResult() {
+
+        // ---------------------------------------------------------
+        // Reset only the segments that exist in the objective file
+        // ---------------------------------------------------------
+
+        for (Purpose purpose :
+                discretionaryObjectiveTourModeShare.keySet()) {
+
+            for (Occupation occupation :
+                    discretionaryObjectiveTourModeShare
+                            .get(purpose)
+                            .keySet()) {
+
+                for (String dayType :
+                        discretionaryObjectiveTourModeShare
+                                .get(purpose)
+                                .get(occupation)
+                                .keySet()) {
+
+                    for (RegioStaR2 regioStaR2 :
+                            discretionaryObjectiveTourModeShare
+                                    .get(purpose)
+                                    .get(occupation)
+                                    .get(dayType)
+                                    .keySet()) {
+
+                        for (Mode mode : Mode.getModes()) {
+
+                            simulatedDiscretionaryTourModeCount
+                                    .get(purpose)
+                                    .get(occupation)
+                                    .get(dayType)
+                                    .get(regioStaR2)
+                                    .put(mode, 0);
+
+                            simulatedDiscretionaryTourModeShare
+                                    .get(purpose)
+                                    .get(occupation)
+                                    .get(dayType)
+                                    .get(regioStaR2)
+                                    .put(mode, 0.0);
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // ---------------------------------------------------------
+        // Count simulated discretionary tours
+        // ---------------------------------------------------------
+
+        for (Household household :
+                dataSet.getHouseholds().values()) {
+
+            if (!household.getSimulated()) {
+                continue;
+            }
+
+            for (Person person : household.getPersons()) {
+
+                Occupation occupation =
+                        person.getOccupation();
+
+                RegioStaR2 regioStaR2 =
+                        dataSet.getZones()
+                                .get(
+                                        person.getHousehold()
+                                                .getLocation()
+                                                .getZoneId())
+                                .getRegioStaR2Type();
+
+
+                for (Tour tour :
+                        person.getPlan().getTours().values()) {
+
+                    Purpose purpose =
+                            tour.getMainActivity()
+                                    .getPurpose();
+
+                    if (!Purpose.getDiscretionaryPurposes()
+                            .contains(purpose)) {
+                        continue;
+                    }
+
+
+                    String dayType =
+                            getDayType(person, tour);
+
+
+                    // -------------------------------------------------
+                    // Only count combinations that exist in objective
+                    // -------------------------------------------------
+
+                    if (!discretionaryObjectiveTourModeShare
+                            .containsKey(purpose)) {
+                        continue;
+                    }
+
+                    if (!discretionaryObjectiveTourModeShare
+                            .get(purpose)
+                            .containsKey(occupation)) {
+                        continue;
+                    }
+
+                    if (!discretionaryObjectiveTourModeShare
+                            .get(purpose)
+                            .get(occupation)
+                            .containsKey(dayType)) {
+                        continue;
+                    }
+
+                    if (!discretionaryObjectiveTourModeShare
+                            .get(purpose)
+                            .get(occupation)
+                            .get(dayType)
+                            .containsKey(regioStaR2)) {
+                        continue;
+                    }
+
+
+                    Mode mode = tour.getTourMode();
+
+
+                    int count =
+                            simulatedDiscretionaryTourModeCount
+                                    .get(purpose)
+                                    .get(occupation)
+                                    .get(dayType)
+                                    .get(regioStaR2)
+                                    .get(mode);
+
+                    simulatedDiscretionaryTourModeCount
+                            .get(purpose)
+                            .get(occupation)
+                            .get(dayType)
+                            .get(regioStaR2)
+                            .put(
+                                    mode,
+                                    count + 1);
+                }
+            }
+        }
+
+
+        // ---------------------------------------------------------
+        // Calculate discretionary mode shares
+        // ---------------------------------------------------------
+
+        for (Purpose purpose :
+                discretionaryObjectiveTourModeShare.keySet()) {
+
+            for (Occupation occupation :
+                    discretionaryObjectiveTourModeShare
+                            .get(purpose)
+                            .keySet()) {
+
+                for (String dayType :
+                        discretionaryObjectiveTourModeShare
+                                .get(purpose)
+                                .get(occupation)
+                                .keySet()) {
+
+                    for (RegioStaR2 regioStaR2 :
+                            discretionaryObjectiveTourModeShare
+                                    .get(purpose)
+                                    .get(occupation)
+                                    .get(dayType)
+                                    .keySet()) {
+
+                        int cumulativeSum = 0;
+
+                        for (Mode mode : Mode.getModes()) {
+
+                            cumulativeSum +=
+                                    simulatedDiscretionaryTourModeCount
+                                            .get(purpose)
+                                            .get(occupation)
+                                            .get(dayType)
+                                            .get(regioStaR2)
+                                            .get(mode);
+                        }
+
+                        if (cumulativeSum > 0) {
+
+                            for (Mode mode : Mode.getModes()) {
+
+                                double share =
+                                        (double)
+                                                simulatedDiscretionaryTourModeCount
+                                                        .get(purpose)
+                                                        .get(occupation)
+                                                        .get(dayType)
+                                                        .get(regioStaR2)
+                                                        .get(mode)
+                                                / cumulativeSum;
+
+                                simulatedDiscretionaryTourModeShare
+                                        .get(purpose)
+                                        .get(occupation)
+                                        .get(dayType)
+                                        .get(regioStaR2)
+                                        .put(
+                                                mode,
+                                                share);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private void printFinalCoefficientsTable(Map<Purpose, Map<Mode, Map<String, Double>>> finalCoefficientsTable) throws FileNotFoundException {
 
 //        accompanyMode_nestedLogit.csv
@@ -481,9 +1267,6 @@ public class TourModeChoiceCalibration implements ModelComponent {
         }
         pw.close();
 
-        //one for discretionary
-
-
         for (Purpose purpose : Purpose.getDiscretionaryPurposes()) {
 
             logger.info("Writing tour mode choice coefficient + calibration factors: " + inputFolder + purpose + "Mode_nestedLogit_calibrated.csv");
@@ -513,5 +1296,186 @@ public class TourModeChoiceCalibration implements ModelComponent {
 
     }
 
+    private void printCalibrationFactors() throws FileNotFoundException {
+
+        String mandatoryCalibrationFile =
+                inputFolder + "mandatoryMode_nestedLogit_calibrated.csv";
+
+        logger.info(
+                "Writing WORK calibration factors: "
+                        + mandatoryCalibrationFile);
+
+        PrintWriter pw = new PrintWriter(mandatoryCalibrationFile);
+
+        StringBuilder header = new StringBuilder("variable");
+
+        for (Mode mode : Mode.getModes()) {
+            header.append(",");
+            header.append(mode);
+        }
+
+        pw.println(header);
+
+
+        // WORK
+        // Write only the combinations that exist in the objective file.
+
+        for (Occupation occupation :
+                workObjectiveTourModeShare.keySet()) {
+
+            for (RemoteWorkable remoteWorkable :
+                    workObjectiveTourModeShare
+                            .get(occupation)
+                            .keySet()) {
+
+                for (RegioStaR2 regioStaR2 :
+                        workObjectiveTourModeShare
+                                .get(occupation)
+                                .get(remoteWorkable)
+                                .keySet()) {
+
+                    String variableName =
+                            "calibration_work_"
+                                    + occupation.toString().toLowerCase()
+                                    + "_"
+                                    + remoteWorkable.toString().toLowerCase()
+                                    + "_"
+                                    + regioStaR2.toString().toLowerCase();
+
+                    StringBuilder line =
+                            new StringBuilder(variableName);
+
+                    for (Mode mode : Mode.getModes()) {
+
+                        double factor =
+                                tourModeChoiceModelCalibration
+                                        .getUpdatedWorkCalibrationFactors()
+                                        .get(occupation)
+                                        .get(remoteWorkable)
+                                        .get(regioStaR2)
+                                        .get(mode);
+
+                        line.append(",");
+                        line.append(factor);
+                    }
+
+                    pw.println(line);
+                }
+            }
+        }
+
+        pw.close();
+
+
+        // DISCRETIONARY
+        for (Purpose purpose :
+                discretionaryObjectiveTourModeShare.keySet()) {
+
+            String calibrationFile =
+                    inputFolder
+                            + purpose.toString().toLowerCase()
+                            + "Mode_nestedLogit_calibrated.csv";
+
+            logger.info(
+                    "Writing "
+                            + purpose
+                            + " calibration factors: "
+                            + calibrationFile);
+
+            PrintWriter pww =
+                    new PrintWriter(calibrationFile);
+
+            StringBuilder discretionaryHeader =
+                    new StringBuilder("variable");
+
+            for (Mode mode : Mode.getModes()) {
+                discretionaryHeader.append(",");
+                discretionaryHeader.append(mode);
+            }
+
+            pww.println(discretionaryHeader);
+
+
+            for (Occupation occupation :
+                    discretionaryObjectiveTourModeShare
+                            .get(purpose)
+                            .keySet()) {
+
+                for (String dayType :
+                        discretionaryObjectiveTourModeShare
+                                .get(purpose)
+                                .get(occupation)
+                                .keySet()) {
+
+                    for (RegioStaR2 regioStaR2 :
+                            discretionaryObjectiveTourModeShare
+                                    .get(purpose)
+                                    .get(occupation)
+                                    .get(dayType)
+                                    .keySet()) {
+
+                        String variableName =
+                                "calibration_"
+                                        + purpose.toString().toLowerCase()
+                                        + "_"
+                                        + occupation.toString().toLowerCase()
+                                        + "_"
+                                        + dayType.toLowerCase()
+                                        + "_"
+                                        + regioStaR2.toString().toLowerCase();
+
+                        StringBuilder line =
+                                new StringBuilder(variableName);
+
+                        for (Mode mode : Mode.getModes()) {
+
+                            double factor =
+                                    tourModeChoiceModelCalibration
+                                            .getUpdatedDiscretionaryCalibrationFactors()
+                                            .get(purpose)
+                                            .get(occupation)
+                                            .get(dayType)
+                                            .get(regioStaR2)
+                                            .get(mode);
+
+                            line.append(",");
+                            line.append(factor);
+                        }
+
+                        pww.println(line);
+                    }
+                }
+            }
+
+            pww.close();
+        }
+
+
+        logger.info(
+                "Finished writing all tour mode choice calibration factors.");
+    }
+
+    /**
+     * TEMPORARY PLACEHOLDER
+     *
+     * This method will later contain the actual classification of:
+     *
+     * NO_WORKING_DAY
+     * WFH_DAY
+     * WFW_DAY
+     *
+     * For now, all tours are treated as NO_WORKING_DAY
+     * so that the calibration model can run.
+     */
+    private String getDayType(Person person, Tour tour) {
+
+        return "NO_WORKING_DAY";
+    }
+    private RemoteWorkable getRemoteWorkable(Person person) {
+
+        return person.canRemoteWork()
+                ? RemoteWorkable.TRUE
+                : RemoteWorkable.FALSE;
+    }
 
 }
